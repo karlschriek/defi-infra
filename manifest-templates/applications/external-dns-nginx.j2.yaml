@@ -1,0 +1,44 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: external-dns
+  namespace: argocd
+spec:
+  destination:
+    namespace: kube-system
+    server: https://kubernetes.default.svc
+  project: default
+  source:
+    chart: external-dns
+    helm:
+      parameters:
+      - name: serviceAccount.annotations.eks\.amazonaws\.com/role-arn
+        value: {{ role_arn__external_dns }}
+      - name: aws.region
+        value: {{ aws_region }}
+      - name: domainFilters[0]
+        value: {{ route53__hosted_zone_domain }}
+      - name: excludeDomains[0]
+        value: docs-kschriek-12.{{ route53__hosted_zone_domain }} #TODO this is a temporary fix!
+      - name: serviceAccount.create
+        value: 'true'
+      - name: rbac.create
+        value: 'true'
+      - name: resources.limits.cpu
+        value: 100m
+      - name: resources.limits.memory
+        value: 300Mi
+      - name: resources.requests.cpu
+        value: 100m
+      - name: resources.requests.memory
+        value: 300Mi
+      - name: sources[0]
+        value: service
+      - name: sources[1]
+        value: ingress
+    repoURL: https://charts.bitnami.com/bitnami
+    targetRevision: 5.4.13
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

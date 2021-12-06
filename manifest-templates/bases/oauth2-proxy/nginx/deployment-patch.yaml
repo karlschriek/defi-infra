@@ -1,0 +1,17 @@
+
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: oauth2-proxy
+  namespace: oauth2-proxy
+spec:
+  template:
+    spec:
+      containers:
+      - name: oauth-proxy
+        args:
+        - --upstream=file:///dev/null
+        - --http-address=0.0.0.0:4180
+        - --provider=google
+        - --email-domain="arrikto.com"
+

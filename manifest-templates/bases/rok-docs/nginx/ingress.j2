@@ -1,0 +1,33 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rok-docs
+  annotations:
+    nginx.ingress.kubernetes.io/force-ssl-redirect: "true"
+    nginx.ingress.kubernetes.io/auth-url: "https://$host/oauth2/auth"
+    nginx.ingress.kubernetes.io/auth-signin: "https://$host/oauth2/start?rd=$escaped_request_uri"
+spec:
+  tls:
+    - hosts:
+        - {{ docs_host__internal }}
+      secretName: docs-cert
+  rules:
+  - host: {{ docs_host__internal }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rok-docs
+            port: 
+              number: 80
+      # - path: /develop
+      #   pathType: Prefix
+      #   backend:
+      #     service:
+      #       name: rok-docs-develop
+      #       port: 
+      #         number: 80
+  ingressClassName: nginx
+

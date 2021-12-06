@@ -1,0 +1,257 @@
+name: Build infra and deploy manifests
+on:
+  push:
+    branches: [master]
+defaults:
+  run:
+    shell: bash
+    working-directory: terraform
+jobs:
+  ci-steps:
+    runs-on: ubuntu-latest
+    container:
+      image: public.ecr.aws/i7s5v1d3/terraform-plus:1.0.9
+    steps:
+      - uses: actions/checkout@v2 #checkout code
+      - name: do all
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          SYNC_REPO_TOKEN: ${{ secrets.SYNC_REPO_TOKEN }}
+          RUNNER_APP_ID: ${{ secrets.RUNNER_APP_ID }}
+          RUNNER_APP_INSTALLATION_ID: ${{ secrets.RUNNER_APP_INSTALLATION_ID }}
+          RUNNER_APP_PRIVATE_KEY: ${{ secrets.RUNNER_APP_PRIVATE_KEY }}
+          GCR_JSON_KEY: ${{ secrets.GCR_JSON_KEY }}
+          ROLE_ARN: arn:aws:iam::409688176173:role/terraform-ci
+          KUBERNETES_ADMIN_ROLE_ARN: arn:aws:iam::409688176173:role/kubernetes-admin
+          USER_ARN: arn:aws:iam::409688176173:user/ci-admin
+          AWS_REGION: us-east-1
+          USERNAME: kschriek
+          CLUSTER_NAME: github-runners
+          SYNC_REPO_URL: "github.com/karlschriek/manifests-github.git"
+          SYNC_REPO_TARGET_BRANCH: "argocd-manifests"
+          SYNC_REPO_PATCH_BRANCH: "argocd-manifests-autopatch"
+
+
+        run: |
+
+          NC="\e[0m"
+          COL1="\e[1;33m"
+
+          echo -e " \n${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Outputting versions of key packages. ${NC}"
+          # print versions
+          aws --version
+          terraform --version
+          kubectl version --client
+          kustomize version
+          pip --version
+          gh --version
+          j2 --version
+
+
+          echo -e " \n${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Now performing terraform init, plan and apply. ${NC}"
+          ### Variables for TF state file
+          export TFSTATE_BUCKET=terraform-states-409688176173-$AWS_REGION                   
+          export TFSTATE_KEY=$CLUSTER_NAME
+          export TFSTATE_REGION=$AWS_REGION
+          # export TFSTATE_ROLE_ARN=$ROLE_ARN #TODO use this again later
+
+          ### Terraform input variables
+          export TF_VAR_cluster_name=$CLUSTER_NAME
+          # export TF_VAR_role_arn=$ROLE_ARN #TODO use this again later
+          export TF_VAR_region=$AWS_REGION
+          export TF_VAR_argocd_github_token=$SYNC_REPO_TOKEN
+          export TF_VAR_git_repo_url=https://$SYNC_REPO_URL
+          export TF_VAR_git_repo_target_revision=$SYNC_REPO_TARGET_BRANCH
+          export TF_VAR_additional_kubernetes_admin_role_arn=$KUBERNETES_ADMIN_ROLE_ARN
+          export TF_VAR_cert_manager_email_user=$USERNAME
+          export TF_VAR_cert_manager_email_domain=arrikto.com
+
+          export TF_VAR_actions_app_id=$RUNNER_APP_ID
+          export TF_VAR_actions_app_installation_id=$RUNNER_APP_INSTALLATION_ID
+          export TF_VAR_actions_app_private_key=$RUNNER_APP_PRIVATE_KEY
+          # export TF_VAR_actions_token=  #Not used for now
+          export TF_VAR_gcr_json_key=$GCR_JSON_KEY
+
+          terraform init \
+              -backend-config="bucket=${TFSTATE_BUCKET}" \
+              -backend-config="key=${TFSTATE_KEY}" \
+              -backend-config="region=${TFSTATE_REGION}"
+
+          terraform plan \
+            -input=false \
+            -out=build.tfplan
+
+          terraform apply \
+            -auto-approve \
+            build.tfplan
+
+          # terraform destroy \
+          #   -auto-approve
+
+          echo -e " \n${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Now connecting to Kubernetes and updating aws-auth configmap using the aws cli and kubectl. ${NC}"
+
+          ### Add EKS cluster to Kubeconfig
+          aws eks update-kubeconfig --name $CLUSTER_NAME
+
+          ### Update aws-auth configmap
+          kubectl apply -f output/aws-auth.yaml
+          cat output/aws-auth.yaml
+
+          echo -e " \n${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Now applying .env files to manifest templates using J2. ${NC}"
+
+          # cat output/vars.env
+
+          cd ..
+          ### Set input vars
+          export TEMPLATES_DIR=$PWD/manifest-templates  # directory where the .j2 template files can be found 
+          export MANIFESTS_DIR=$PWD/manifests  # directory where the created YAML files should be output to
+          export DOT_ENV_PATH=$PWD/terraform/output/vars.env # location of the .env file
+          export GPG_PRIV_KEY_PATH=$PWD/terraform/output/ksops_priv.asc
+          export KUSTOMIZATION_PATH=$PWD/kustomization.yaml
+          export SOPS_CONFIG_PATH=$TEMPLATES_DIR/.sops.j2.yaml
+
+          ### Define helper function
+          function generate_manifests() {
+              IN_PATH=$1
+              OUT_DIR=$2              
+              COL2="\e[0;32m"
+
+              # first get the extension, so we can filter out non-j2 files
+              FILENAME=$(basename -- "$IN_PATH")
+              EXTENSION=."${FILENAME#*.*}"
+              FILENAME_TRUNK="${FILENAME/$EXTENSION/''}"
+
+              # Apply j2
+              echo "Found $IN_PATH"              
+              if [[ $EXTENSION == *.j2* ]]; then                
+                OUT_PATH="${IN_PATH/.j2/''}"
+                echo -e "${NC} -- Applying j2 on ${IN_PATH/$TEMPLATES_DIR/''} -> ${OUT_PATH/$TEMPLATES_DIR/''}. ${NC}"
+                j2 --format=env $IN_PATH $DOT_ENV_PATH -o $OUT_PATH --filters $TEMPLATES_DIR/filters.py
+                IN_PATH=$OUT_PATH
+              fi              
+
+              # Apply Secret generation from .senv file
+              if [[ $EXTENSION == *.senv* ]]; then           
+                OUT_PATH="${IN_PATH/.senv/''}"
+                echo -e "${COL2} -- Applying 'kubectl create secret' on ${IN_PATH/$TEMPLATES_DIR/''} -> ${OUT_PATH/$TEMPLATES_DIR/''}. ${NC}"
+                kubectl create secret generic $FILENAME_TRUNK --from-env-file=$IN_PATH --dry-run=client -o yaml > $OUT_PATH
+                IN_PATH=$OUT_PATH
+              fi              
+
+              # Apply SOPS encryption on .dec file
+              if [[ $EXTENSION == *.dec* ]]; then           
+                OUT_PATH="${IN_PATH/.dec/''}"
+                echo -e "${COL2} -- Applying sops on ${IN_PATH/$TEMPLATES_DIR/''} -> ${OUT_PATH/$TEMPLATES_DIR/''}. ${NC}"
+                sops --encrypt --config=$TEMPLATES_DIR/.sops.yaml $IN_PATH > $OUT_PATH
+                #{sops --encrypt --config=$TEMPLATES_DIR/.sops.yaml $IN_PATH > $OUT_PATH} 2>/dev/nul #suppress output
+                
+                IN_PATH=$OUT_PATH
+              fi
+              
+              #Copy result to manifests dir
+              OUT_PATH=${IN_PATH/$TEMPLATES_DIR/$OUT_DIR}
+              mkdir -p $(dirname "${OUT_PATH}")
+              echo -e "${NC} -- Copying ${IN_PATH/$} -> ${OUT_PATH} ${NC}"
+              cp $IN_PATH $OUT_PATH
+              echo "--------------------------------------------------------------------------------------------------------------------------"
+              echo ""
+               
+
+          }
+          export -f generate_manifests # export so that it can be run in next step
+
+          # import public GPG key
+          gpg --import $GPG_PRIV_KEY_PATH
+
+          # first apply j2 to .sops.yaml.j2
+          j2 --format=env $SOPS_CONFIG_PATH $DOT_ENV_PATH -o ${SOPS_CONFIG_PATH/.j2/''}
+          rm -f  $SOPS_CONFIG_PATH
+
+          ### Run recursively
+          find $TEMPLATES_DIR -type f -exec bash -c 'generate_manifests "$0" $MANIFESTS_DIR' {} \; # recurse over all files in $TEMPLATES_DIR and run "apply_j2" with the filepath as argument
+
+          ### Add kustomization file to manifests
+          cp -rf $KUSTOMIZATION_PATH $MANIFESTS_DIR/
+
+          echo -e " \n${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Now rolling out ArgoCD using kubectl and kustomize  ${NC}."
+
+          ### Roll out argocd
+          cd manifests
+          kustomize build --enable-alpha-plugins bases/argocd/ | kubectl apply -f -
+
+          ### Roll out docs
+          kubectl apply -f applications/all-applications.yaml
+
+          PASSWORD=$(kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d)
+          cat << EOF
+          ArgoCD PWD: $PASSWORD
+          Dashboard can be accessed via:
+          $ aws eks update-kubeconfig --name $CLUSTER_NAME
+          $ kubectl port-forward svc/argocd-server -n argocd 8000:80
+          EOF
+
+
+          echo -e " \n${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Now using git to check out the sync repo and commit/push the new manifests to a temporary path branch ${NC}."
+
+          git config --global user.email ${USERNAME}@arrikto.com
+          git config --global user.name ${USERNAME}
+
+          cd ../..
+
+          # Fetch sync repo and commit/push to it
+          git clone "https://token:$SYNC_REPO_TOKEN@$SYNC_REPO_URL" sync_repo
+          cd sync_repo
+
+          # checkout an existing patch branch, or create a new one from target branch
+          git checkout $SYNC_REPO_TARGET_BRANCH           
+               
+          # remove contents of "manifests" folder and replace with the newest manifests
+          rm -rf manifests
+          cp -r $MANIFESTS_DIR manifests
+
+          git status
+
+          # commit the new "manifests" and push to the patch branch
+          git add --all
+          git diff-index --quiet HEAD || git commit -m 'update after automated build' # commit if there is something to commit
+          git push --set-upstream origin $SYNC_REPO_TARGET_BRANCH
+
+
+          # # checkout an existing patch branch, or create a new one from target branch
+          # git checkout $SYNC_REPO_TARGET_BRANCH           
+          # git checkout $SYNC_REPO_PATCH_BRANCH || git checkout -b $SYNC_REPO_PATCH_BRANCH 
+          # git pull
+
+          # # rebase patch branch onto the sync branch
+          # git rebase $SYNC_REPO_TARGET_BRANCH 
+
+          # # remove contents of "manifests" folder and replace with the newest manifests
+          # rm -rf manifests
+          # cp -r $MANIFESTS_DIR manifests
+
+          # git status
+
+          # # commit the new "manifests" and push to the patch branch
+          # git add --all
+          # git diff-index --quiet HEAD || git commit -m 'update after automated build' # commit if there is something to commit
+          # git push --set-upstream origin $SYNC_REPO_PATCH_BRANCH
+
+          # echo -e "${COL1}>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>> Now using GitHub CLI to create an automated PR from the patch branch to the target branch ${NC}."
+
+          # # log into GitHub
+          # echo "$SYNC_REPO_TOKEN" >.githubtoken # read token into temporary file (the gh cli provides no other way to authenticate with a token)
+          # # gh auth login --with-token <.githubtoken --hostname arrikto 
+          # gh auth login --with-token <.githubtoken 
+
+          # # create a PR
+
+          # PR_STATUS=$(gh pr status --jq ".createdBy[0].state" --json state) #check if PR currently open
+
+          # if [ -z "$PR_STATUS" ] || [ $PR_STATUS != "OPEN" ];
+          # then
+          #   gh pr create --title "automated patch" --body "testing automated patching" --reviewer karlschriek --base $SYNC_REPO_TARGET_BRANCH --head $SYNC_REPO_PATCH_BRANCH
+          # else
+          #   echo "PR already exists with status $PR_STATUS"
+          #   gh pr status
+          # fi

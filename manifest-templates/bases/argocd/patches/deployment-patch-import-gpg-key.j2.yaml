@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: argocd-repo-server
+spec:
+  template:
+    spec:
+      volumes:
+        - name: gnupg-home
+          emptyDir: {}
+        - name: private-gpg-key
+          secret:
+            secretName: private-gpg-key-secret
+            items:
+            - key: PRIVATE_GPG_KEY
+              path: private-gpg-key.asc
+      initContainers:
+        - name: import-gpg-key
+          image: quay.io/argoproj/argocd:latest
+          command: ["gpg", "--import", "/private-gpg-key/private-gpg-key.asc"]
+          env:
+            - name: GNUPGHOME
+              value: /gnupg-home/.gnupg
+          volumeMounts:
+            - mountPath: /private-gpg-key
+              name: private-gpg-key
+              readOnly: true
+            - mountPath: /gnupg-home
+              name: gnupg-home
+      containers:
+        - name: argocd-repo-server
+          env:
+            - name: GNUPGHOME
+              value: /home/argocd/.gnupg
+          volumeMounts:
+            - mountPath: /home/argocd/.gnupg
+              name: gnupg-home
+              subPath: .gnupg
+              # Note: can't be readOnly as gpg wants to create agent socket

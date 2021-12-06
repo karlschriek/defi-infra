@@ -1,0 +1,9 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: sops
+
+# Note, these manifests were extracted from the 0.3.7 charts at https://github.com/isindir/sops-secrets-operator/tree/0.3.7
+resources:
+- crds.yaml
+- controller.yaml
+- namespace.yaml

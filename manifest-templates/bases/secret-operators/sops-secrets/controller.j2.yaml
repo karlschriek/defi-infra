@@ -1,0 +1,181 @@
+# Source: sops-secrets-operator/templates/service_account.yaml
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: sops-secrets-operator
+  labels:
+    app.kubernetes.io/name: sops-secrets-operator
+---
+# Source: sops-secrets-operator/templates/cluster_role.yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: sops-secrets-operator
+  labels:
+    app.kubernetes.io/name: sops-secrets-operator
+rules:
+- apiGroups:
+  - coordination.k8s.io
+  resources:
+  - leases
+  verbs:
+  - '*'
+- apiGroups:
+  - ""
+  resources:
+  - configmaps
+  - secrets
+  verbs:
+  - '*'
+- apiGroups:
+  - ""
+  resources:
+  - secrets/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - events.k8s.io
+  - ""
+  resources:
+  - events
+  verbs:
+  - '*'
+- apiGroups:
+  - monitoring.coreos.com
+  resources:
+  - servicemonitors
+  verbs:
+  - get
+  - create
+- apiGroups:
+  - isindir.github.com
+  resources:
+  - sopssecrets
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - isindir.github.com
+  resources:
+  - sopssecrets/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - isindir.github.com
+  resources:
+  - sopssecrets/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+# Source: sops-secrets-operator/templates/cluster_role_binding.yaml
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: sops-secrets-operator
+  labels:
+    app.kubernetes.io/name: sops-secrets-operator
+subjects:
+- kind: ServiceAccount
+  name: sops-secrets-operator
+  namespace: default
+roleRef:
+  kind: ClusterRole
+  name: sops-secrets-operator
+  apiGroup: rbac.authorization.k8s.io
+---
+# Source: sops-secrets-operator/templates/operator.yaml
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sops-secrets-operator
+  labels:
+    app.kubernetes.io/name: sops-secrets-operator
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: sops-secrets-operator      
+  template:
+    metadata:
+      annotations:
+        kubectl.kubernetes.io/default-container: sops-secrets-operator
+      labels:
+        control-plane: controller-sops-secrets-operator
+        app.kubernetes.io/name: sops-secrets-operator        
+    spec:
+      serviceAccountName: sops-secrets-operator
+      initContainers:
+        - name: init-myservice
+          # https://hub.docker.com/_/ubuntu?tab=tags&page=1&ordering=last_updated
+          image: "ubuntu:focal-20211006"
+          imagePullPolicy: Always
+          command: ['/bin/sh', '-c', 'cp -Lr /var/secrets/gpg-secrets/* /var/secrets/gpg/']
+          volumeMounts:
+          - mountPath: /var/secrets/gpg
+            name: sops-gpg
+          - mountPath: /var/secrets/gpg-secrets
+            name: sops-operator-gpg-keys1
+          - mountPath: /var/secrets/gpg-secrets/private-keys-v1.d
+            name: sops-operator-gpg-keys2
+      containers:
+        - name: sops-secrets-operator
+          image: "isindir/sops-secrets-operator:0.3.7"
+          imagePullPolicy: Always
+          volumeMounts:
+          - mountPath: /var/secrets/gpg
+            name: sops-gpg
+          - mountPath: /var/secrets/gpg-secrets
+            name: sops-operator-gpg-keys1
+          - mountPath: /var/secrets/gpg-secrets/private-keys-v1.d
+            name: sops-operator-gpg-keys2
+          command:
+          - /usr/local/bin/manager
+          args:
+          # The address the metric endpoint binds to. (default ":8080")
+          #- "--metrics-bind-address=127.0.0.1:8080"
+          - "--health-probe-bind-address=:8081"
+          # Enable leader election for controller manager. Enabling this will ensure there is only one active controller manager.
+          - "--leader-elect"
+          - "--requeue-decrypt-after=5"
+          - "--zap-encoder=json"
+          - "--zap-log-level=info"
+          - "--zap-stacktrace-level=error"
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8081
+            initialDelaySeconds: 15
+            periodSeconds: 20
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: 8081
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: GNUPGHOME
+              value: /var/secrets/gpg
+          resources:
+            {}
+      volumes:
+      - name: sops-operator-gpg-keys1
+        secret:
+          secretName: gpg1
+      - name: sops-operator-gpg-keys2
+        secret:
+          secretName: gpg2
+      - name: sops-gpg
+        emptyDir: {}
